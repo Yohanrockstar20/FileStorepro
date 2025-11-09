@@ -4,7 +4,7 @@ from config import LOGGER
 import asyncio, random, string, requests
 
 # =============================================================== #
-# AUTO SHORTENER FOR MEDIA WITH FIXED FORWARD + CUSTOM ALIAS
+# AUTO SHORTENER FOR MEDIA WITH PROPER FORWARD HANDLING + CUSTOM ALIAS
 # =============================================================== #
 
 def generate_alias():
@@ -21,44 +21,48 @@ async def media_auto_shortener(client: Client, message: Message):
         db_chat = getattr(client, "primary_db_channel", None) or getattr(client, "db", None)
         file_url = None
 
-        # 1️⃣ Forward file to DB/public channel
+        # 1️⃣ Forward to DB/public channel
         if db_chat:
             try:
                 forwarded = await client.forward_messages(
                     chat_id=db_chat,
                     from_chat_id=message.chat.id,
-                    message_ids=[message.message_id]
+                    message_ids=[message.id]
                 )
 
-                # handle both single and list types
-                if isinstance(forwarded, list):
-                    fwd_msg = forwarded[0]
-                else:
-                    fwd_msg = forwarded
+                # Pyrogram can return a single Message or a list
+                fwd_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
+                fwd_id = getattr(fwd_msg, "id", None) or getattr(fwd_msg, "message_id", None)
 
+                if not fwd_id:
+                    raise Exception("Forward failed — no message ID received")
+
+                # Get chat info
                 db_chat_obj = await client.get_chat(db_chat)
                 if getattr(db_chat_obj, "username", None):
-                    file_url = f"https://t.me/{db_chat_obj.username}/{fwd_msg.id}"
+                    file_url = f"https://t.me/{db_chat_obj.username}/{fwd_id}"
                 else:
+                    # Private channel with no username
                     cid = str(db_chat).replace("-100", "")
-                    file_url = f"https://t.me/c/{cid}/{fwd_msg.id}"
+                    file_url = f"https://t.me/c/{cid}/{fwd_id}"
 
             except Exception as e:
                 LOGGER(__name__, client.name).warning(f"Forward failed: {e}")
 
-        # 2️⃣ If forward failed, fallback pseudo link
+        # 2️⃣ If still no valid URL — fallback gracefully
         if not file_url:
             bot_me = await client.get_me()
-            token = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10))
-            file_url = f"https://t.me/{bot_me.username}?start={token}"
+            file_url = f"https://t.me/{bot_me.username}"  # fallback only
 
-        # 3️⃣ Call your shortener API with alias
+        # 3️⃣ Create custom alias
         alias = generate_alias()
+
+        # 4️⃣ Shorten link with shortener
+        short_link = file_url
         short_url = getattr(client, "short_url", None)
         short_api = getattr(client, "short_api", None)
         shortner_enabled = getattr(client, "shortner_enabled", True)
 
-        short_link = file_url
         if shortner_enabled and short_url and short_api:
             try:
                 api_endpoint = f"https://{short_url}/api?api={short_api}&url={file_url}&alias={alias}"
@@ -71,7 +75,7 @@ async def media_auto_shortener(client: Client, message: Message):
             except Exception as e:
                 LOGGER(__name__, client.name).warning(f"Shortener request failed: {e}")
 
-        # 4️⃣ Send result in button format
+        # 5️⃣ Send clean message
         text = "🔴 HERE IS YOUR LINK:"
         buttons = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔗 CLICK HERE TO OPEN", url=short_link)]]
