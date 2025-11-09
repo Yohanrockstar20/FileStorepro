@@ -1,27 +1,43 @@
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from config import LOGGER
+from config import SHORT_URL, SHORT_API, LOGGER
 import asyncio, random, string, requests
 
 # =============================================================== #
-# AUTO SHORTENER FOR MEDIA WITH PROPER FORWARD HANDLING + CUSTOM ALIAS
+# AUTO SHORTENER WITH GPLINKS + CUSTOM ALIAS
 # =============================================================== #
 
 def generate_alias():
-    """Generate alias like ___Ab9fK3___"""
+    """Generate alias like ___A7b9Kd___"""
     chars = string.ascii_letters + string.digits
     rand_str = ''.join(random.choice(chars) for _ in range(random.randint(6, 10)))
     return f"___{rand_str}___"
 
+def create_shortlink_gplinks(long_url):
+    """Send request to GPLINKS API with alias and return short URL"""
+    alias = generate_alias()
+    api_endpoint = f"https://{SHORT_URL}/api?api={SHORT_API}&url={long_url}&alias={alias}"
+    try:
+        res = requests.get(api_endpoint, timeout=10)
+        data = res.json()
+        if data.get("status") == "success":
+            return data.get("shortenedUrl", long_url)
+        else:
+            LOGGER("link_generator", "bot").warning(f"Shortener failed: {data}")
+            return long_url
+    except Exception as e:
+        LOGGER("link_generator", "bot").warning(f"Shortener error: {e}")
+        return long_url
+
 @Client.on_message(filters.private & (filters.photo | filters.video | filters.document | filters.audio | filters.animation))
 async def media_auto_shortener(client: Client, message: Message):
-    """Forward media to DB/public channel and generate a short link."""
+    """Auto shortener that creates GPLINKS link with alias"""
     try:
         wait_msg = await message.reply_text("🔁 Processing your file... please wait", quote=True)
         db_chat = getattr(client, "primary_db_channel", None) or getattr(client, "db", None)
         file_url = None
 
-        # 1️⃣ Forward to DB/public channel
+        # 1️⃣ Try to forward file to DB/public channel
         if db_chat:
             try:
                 forwarded = await client.forward_messages(
@@ -29,53 +45,28 @@ async def media_auto_shortener(client: Client, message: Message):
                     from_chat_id=message.chat.id,
                     message_ids=[message.id]
                 )
-
-                # Pyrogram can return a single Message or a list
                 fwd_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
                 fwd_id = getattr(fwd_msg, "id", None) or getattr(fwd_msg, "message_id", None)
-
-                if not fwd_id:
-                    raise Exception("Forward failed — no message ID received")
-
-                # Get chat info
                 db_chat_obj = await client.get_chat(db_chat)
+
                 if getattr(db_chat_obj, "username", None):
                     file_url = f"https://t.me/{db_chat_obj.username}/{fwd_id}"
                 else:
-                    # Private channel with no username
                     cid = str(db_chat).replace("-100", "")
                     file_url = f"https://t.me/c/{cid}/{fwd_id}"
-
             except Exception as e:
                 LOGGER(__name__, client.name).warning(f"Forward failed: {e}")
 
-        # 2️⃣ If still no valid URL — fallback gracefully
+        # 2️⃣ Fallback (if no DB or forward fails)
         if not file_url:
             bot_me = await client.get_me()
-            file_url = f"https://t.me/{bot_me.username}"  # fallback only
+            token = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10))
+            file_url = f"https://t.me/{bot_me.username}?start={token}"
 
-        # 3️⃣ Create custom alias
-        alias = generate_alias()
+        # 3️⃣ Create short link using GPLINKS
+        short_link = await asyncio.get_event_loop().run_in_executor(None, lambda: create_shortlink_gplinks(file_url))
 
-        # 4️⃣ Shorten link with shortener
-        short_link = file_url
-        short_url = getattr(client, "short_url", None)
-        short_api = getattr(client, "short_api", None)
-        shortner_enabled = getattr(client, "shortner_enabled", True)
-
-        if shortner_enabled and short_url and short_api:
-            try:
-                api_endpoint = f"https://{short_url}/api?api={short_api}&url={file_url}&alias={alias}"
-                response = requests.get(api_endpoint, timeout=10)
-                data = response.json()
-                if data.get("status") == "success":
-                    short_link = data.get("shortenedUrl", file_url)
-                else:
-                    LOGGER(__name__, client.name).warning(f"Shortener failed: {data}")
-            except Exception as e:
-                LOGGER(__name__, client.name).warning(f"Shortener request failed: {e}")
-
-        # 5️⃣ Send clean message
+        # 4️⃣ Send button message
         text = "🔴 HERE IS YOUR LINK:"
         buttons = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔗 CLICK HERE TO OPEN", url=short_link)]]
