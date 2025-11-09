@@ -1,30 +1,30 @@
-# Simple Direct Link Generator with Universal Shortener Support
-# Clean and minimal — works with any shortener like anyshorturl.com / gplinks / tnshort etc.
+# ===============================================================
+# LINK GENERATOR MODULE (with built-in shortener)
+# Works for any shortener site (anyshorturl.com, gplinks, tnshort, etc.)
+# ===============================================================
 
-import requests, random, string
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from config import LOG_CHANNEL, SHORT_URL, SHORT_API, ADMINS
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from config import LOGGER, SHORT_URL, SHORT_API
+import requests, asyncio, random, string
 
-# -----------------------------------------
-# Helper: check if user is allowed
-# -----------------------------------------
-async def allowed(_, __, message):
-    if message.from_user and message.from_user.id in ADMINS:
-        return True
-    return False
-
-
-# -----------------------------------------
-# Helper: shortener API (no alias)
-# -----------------------------------------
-def create_shortlink(short_url, short_api, long_url):
-    """Generic shortener for any site supporting ?api=<API_KEY>&url=<URL>"""
+# ===============================================================
+# UNIVERSAL SHORTENER FUNCTION (from VJ logic)
+# ===============================================================
+def create_shortlink(long_url: str) -> str:
+    """
+    Generate a short link using any shortener site that supports:
+    https://domain/api?api=<API_KEY>&url=<URL>
+    """
+    short_url = SHORT_URL
+    short_api = SHORT_API
     api_endpoint = f"https://{short_url}/api?api={short_api}&url={long_url}"
+
     try:
         res = requests.get(api_endpoint, timeout=10)
         data = res.json()
-        # Try to detect correct key name automatically
+
+        # Detect correct field automatically
         if data.get("status") == "success":
             return data.get("shortenedUrl", long_url)
         elif "shortenedUrl" in data:
@@ -40,33 +40,67 @@ def create_shortlink(short_url, short_api, long_url):
         return long_url
 
 
-# -----------------------------------------
-# Main: handle files and generate links
-# -----------------------------------------
-@Client.on_message((filters.document | filters.video | filters.audio | filters.photo) & filters.private & filters.create(allowed))
-async def shortener_gen(bot, message):
+# ===============================================================
+# AUTO LINK GENERATOR HANDLER
+# ===============================================================
+@Client.on_message((filters.document | filters.video | filters.audio | filters.photo) & filters.private)
+async def link_generator(client: Client, message: Message):
+    """
+    Handles any media message from a user:
+    1. Forwards it to the DB/log channel.
+    2. Builds a Telegram t.me link.
+    3. Shortens it using the configured shortener API.
+    4. Sends the final short link with a button.
+    """
+
     try:
-        waiting = await message.reply_text("🔁 Uploading your file... please wait.", quote=True)
-        # Copy message to your log/db channel
-        post = await message.copy(LOG_CHANNEL)
-        file_id = post.id
+        wait_msg = await message.reply_text("🔁 Uploading your file... please wait.", quote=True)
 
-        # Build direct Telegram message link
-        chat = await bot.get_chat(LOG_CHANNEL)
-        if getattr(chat, "username", None):
-            long_url = f"https://t.me/{chat.username}/{file_id}"
-        else:
-            cid = str(LOG_CHANNEL).replace("-100", "")
-            long_url = f"https://t.me/c/{cid}/{file_id}"
+        # Get DB/log channel
+        db_chat = getattr(client, "primary_db_channel", None) or getattr(client, "db", None)
+        file_url = None
 
-        # Generate short link
-        short_link = create_shortlink(SHORT_URL, SHORT_API, long_url)
+        # 1️⃣ Forward file to DB/public channel
+        if db_chat:
+            try:
+                forwarded = await client.forward_messages(
+                    chat_id=db_chat,
+                    from_chat_id=message.chat.id,
+                    message_ids=[message.id]
+                )
 
-        # Reply to user
+                fwd_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
+                fwd_id = getattr(fwd_msg, "id", None) or getattr(fwd_msg, "message_id", None)
+                db_chat_obj = await client.get_chat(db_chat)
+
+                # Public channel
+                if getattr(db_chat_obj, "username", None):
+                    file_url = f"https://t.me/{db_chat_obj.username}/{fwd_id}"
+                else:
+                    # Private channel (no username)
+                    cid = str(db_chat).replace("-100", "")
+                    file_url = f"https://t.me/c/{cid}/{fwd_id}"
+
+            except Exception as e:
+                LOGGER(__name__, client.name).warning(f"Forward failed: {e}")
+
+        # 2️⃣ Fallback: no DB or forward failed
+        if not file_url:
+            bot_me = await client.get_me()
+            token = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10))
+            file_url = f"https://t.me/{bot_me.username}?start={token}"
+
+        # 3️⃣ Create short link (directly via API)
+        short_link = await asyncio.get_event_loop().run_in_executor(None, lambda: create_shortlink(file_url))
+
+        # 4️⃣ Send link to user
         text = "🔴 HERE IS YOUR LINK:"
-        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 CLICK HERE TO OPEN", url=short_link)]])
-        await waiting.delete()
+        buttons = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔗 CLICK HERE TO OPEN", url=short_link)]]
+        )
+
+        await wait_msg.delete()
         await message.reply_text(text, reply_markup=buttons, quote=True)
 
     except Exception as e:
-        await message.reply_text(f"❌ Error: {e}", quote=True)
+        await message.reply_text(f"❌ Failed to generate link: {e}", quote=True)
