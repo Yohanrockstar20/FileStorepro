@@ -1,6 +1,5 @@
 # ===============================================================
-# LINK GENERATOR MODULE (with built-in shortener)
-# Works for any shortener site (anyshorturl.com, gplinks, tnshort, etc.)
+# LINK GENERATOR MODULE (Dynamic shortener + config fallback)
 # ===============================================================
 
 from pyrogram import Client, filters
@@ -9,22 +8,17 @@ from config import LOGGER, SHORT_URL, SHORT_API
 import requests, asyncio, random, string
 
 # ===============================================================
-# UNIVERSAL SHORTENER FUNCTION (from VJ logic)
+# UNIVERSAL SHORTENER FUNCTION
 # ===============================================================
-def create_shortlink(long_url: str) -> str:
-    """
-    Generate a short link using any shortener site that supports:
-    https://domain/api?api=<API_KEY>&url=<URL>
-    """
-    short_url = SHORT_URL
-    short_api = SHORT_API
+def create_shortlink(short_url: str, short_api: str, long_url: str) -> str:
+    """Generic API request for any shortener that supports ?api=<KEY>&url=<URL>"""
     api_endpoint = f"https://{short_url}/api?api={short_api}&url={long_url}"
 
     try:
         res = requests.get(api_endpoint, timeout=10)
         data = res.json()
 
-        # Detect correct field automatically
+        # Detect correct response key automatically
         if data.get("status") == "success":
             return data.get("shortenedUrl", long_url)
         elif "shortenedUrl" in data:
@@ -46,17 +40,17 @@ def create_shortlink(long_url: str) -> str:
 @Client.on_message((filters.document | filters.video | filters.audio | filters.photo) & filters.private)
 async def link_generator(client: Client, message: Message):
     """
-    Handles any media message from a user:
+    When a user sends media:
     1. Forwards it to the DB/log channel.
-    2. Builds a Telegram t.me link.
-    3. Shortens it using the configured shortener API.
-    4. Sends the final short link with a button.
+    2. Builds a Telegram link.
+    3. Looks for user shortener in DB (fallback to config.py).
+    4. Shortens the link.
+    5. Sends the short link as a button.
     """
 
     try:
         wait_msg = await message.reply_text("🔁 Uploading your file... please wait.", quote=True)
 
-        # Get DB/log channel
         db_chat = getattr(client, "primary_db_channel", None) or getattr(client, "db", None)
         file_url = None
 
@@ -73,32 +67,44 @@ async def link_generator(client: Client, message: Message):
                 fwd_id = getattr(fwd_msg, "id", None) or getattr(fwd_msg, "message_id", None)
                 db_chat_obj = await client.get_chat(db_chat)
 
-                # Public channel
                 if getattr(db_chat_obj, "username", None):
                     file_url = f"https://t.me/{db_chat_obj.username}/{fwd_id}"
                 else:
-                    # Private channel (no username)
                     cid = str(db_chat).replace("-100", "")
                     file_url = f"https://t.me/c/{cid}/{fwd_id}"
 
             except Exception as e:
                 LOGGER(__name__, client.name).warning(f"Forward failed: {e}")
 
-        # 2️⃣ Fallback: no DB or forward failed
+        # 2️⃣ Fallback
         if not file_url:
             bot_me = await client.get_me()
             token = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10))
             file_url = f"https://t.me/{bot_me.username}?start={token}"
 
-        # 3️⃣ Create short link (directly via API)
-        short_link = await asyncio.get_event_loop().run_in_executor(None, lambda: create_shortlink(file_url))
+        # 3️⃣ Load shortener settings (user-based, fallback to config)
+        try:
+            # If your project already uses MongoDB or users_api for settings:
+            db_settings = await client.mongodb.get_shortner_settings()
+            short_url = db_settings.get("short_url", SHORT_URL)
+            short_api = db_settings.get("short_api", SHORT_API)
+            short_enabled = db_settings.get("enabled", True)
+        except Exception:
+            # If DB not present or fails, fallback
+            short_url, short_api, short_enabled = SHORT_URL, SHORT_API, True
 
-        # 4️⃣ Send link to user
+        # 4️⃣ Generate short link
+        short_link = file_url
+        if short_enabled and short_url and short_api:
+            short_link = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: create_shortlink(short_url, short_api, file_url)
+            )
+
+        # 5️⃣ Send result
         text = "🔴 HERE IS YOUR LINK:"
         buttons = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔗 CLICK HERE TO OPEN", url=short_link)]]
         )
-
         await wait_msg.delete()
         await message.reply_text(text, reply_markup=buttons, quote=True)
 
