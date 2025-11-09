@@ -1,29 +1,30 @@
-# Modified by ChatGPT for universal shortener support
-# Based on original by @VJ_Botz
+# Simple Direct Link Generator with Universal Shortener Support
+# Clean and minimal — works with any shortener like anyshorturl.com / gplinks / tnshort etc.
 
-import re, os, json, base64, requests
+import requests, random, string
 from pyrogram import Client, filters
-from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, UsernameInvalid, UsernameNotModified
-from config import ADMINS, LOG_CHANNEL, PUBLIC_FILE_STORE, WEBSITE_URL, WEBSITE_URL_MODE, SHORT_URL, SHORT_API
-from plugins.users_api import get_user
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from config import LOG_CHANNEL, SHORT_URL, SHORT_API, ADMINS
 
-# --- Helper for permission check ---
+# -----------------------------------------
+# Helper: check if user is allowed
+# -----------------------------------------
 async def allowed(_, __, message):
-    if PUBLIC_FILE_STORE:
-        return True
     if message.from_user and message.from_user.id in ADMINS:
         return True
     return False
 
 
-# --- Universal shortener (no alias) ---
+# -----------------------------------------
+# Helper: shortener API (no alias)
+# -----------------------------------------
 def create_shortlink(short_url, short_api, long_url):
-    """Generic shortener API call for anyshorturl/gplinks/tnshort"""
+    """Generic shortener for any site supporting ?api=<API_KEY>&url=<URL>"""
     api_endpoint = f"https://{short_url}/api?api={short_api}&url={long_url}"
     try:
         res = requests.get(api_endpoint, timeout=10)
         data = res.json()
+        # Try to detect correct key name automatically
         if data.get("status") == "success":
             return data.get("shortenedUrl", long_url)
         elif "shortenedUrl" in data:
@@ -34,68 +35,38 @@ def create_shortlink(short_url, short_api, long_url):
             return data["short"]
         else:
             return long_url
-    except Exception:
+    except Exception as e:
+        print(f"[Shortener Error] {e}")
         return long_url
 
 
-# =============================================================== #
-# 🔹 Generate short link for uploaded files (direct link)
-# =============================================================== #
+# -----------------------------------------
+# Main: handle files and generate links
+# -----------------------------------------
+@Client.on_message((filters.document | filters.video | filters.audio | filters.photo) & filters.private & filters.create(allowed))
+async def shortener_gen(bot, message):
+    try:
+        waiting = await message.reply_text("🔁 Uploading your file... please wait.", quote=True)
+        # Copy message to your log/db channel
+        post = await message.copy(LOG_CHANNEL)
+        file_id = post.id
 
-@Client.on_message((filters.document | filters.video | filters.audio) & filters.private & filters.create(allowed))
-async def incoming_gen_link(bot, message):
-    username = (await bot.get_me()).username
-    post = await message.copy(LOG_CHANNEL)
-    file_id = str(post.id)
-    encoded = base64.urlsafe_b64encode(f"file_{file_id}".encode("ascii")).decode().strip("=")
+        # Build direct Telegram message link
+        chat = await bot.get_chat(LOG_CHANNEL)
+        if getattr(chat, "username", None):
+            long_url = f"https://t.me/{chat.username}/{file_id}"
+        else:
+            cid = str(LOG_CHANNEL).replace("-100", "")
+            long_url = f"https://t.me/c/{cid}/{file_id}"
 
-    user_id = message.from_user.id
-    user = await get_user(user_id)
+        # Generate short link
+        short_link = create_shortlink(SHORT_URL, SHORT_API, long_url)
 
-    # Determine base link
-    if WEBSITE_URL_MODE:
-        long_link = f"{WEBSITE_URL}?Tech_VJ={encoded}"
-    else:
-        long_link = f"https://t.me/{username}?start={encoded}"
+        # Reply to user
+        text = "🔴 HERE IS YOUR LINK:"
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 CLICK HERE TO OPEN", url=short_link)]])
+        await waiting.delete()
+        await message.reply_text(text, reply_markup=buttons, quote=True)
 
-    # Generate short link using user API or fallback config
-    short_url = user.get("base_site") or SHORT_URL
-    short_api = user.get("shortener_api") or SHORT_API
-
-    short_link = create_shortlink(short_url, short_api, long_link)
-
-    text = "🔴 HERE IS YOUR LINK:"
-    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 CLICK HERE TO OPEN", url=short_link)]])
-    await message.reply_text(text, reply_markup=buttons, quote=True)
-
-
-# =============================================================== #
-# 🔹 /link command — manual reply-based generation
-# =============================================================== #
-
-@Client.on_message(filters.command(['link']) & filters.create(allowed))
-async def gen_link_s(bot, message):
-    username = (await bot.get_me()).username
-    replied = message.reply_to_message
-    if not replied:
-        return await message.reply('Reply to a message to get a shareable link.')
-
-    post = await replied.copy(LOG_CHANNEL)
-    file_id = str(post.id)
-    encoded = base64.urlsafe_b64encode(f"file_{file_id}".encode("ascii")).decode().strip("=")
-
-    user_id = message.from_user.id
-    user = await get_user(user_id)
-
-    if WEBSITE_URL_MODE:
-        long_link = f"{WEBSITE_URL}?Tech_VJ={encoded}"
-    else:
-        long_link = f"https://t.me/{username}?start={encoded}"
-
-    short_url = user.get("base_site") or SHORT_URL
-    short_api = user.get("shortener_api") or SHORT_API
-    short_link = create_shortlink(short_url, short_api, long_link)
-
-    text = "🔴 HERE IS YOUR LINK:"
-    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 CLICK HERE TO OPEN", url=short_link)]])
-    await message.reply_text(text, reply_markup=buttons, quote=True)
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {e}", quote=True)
